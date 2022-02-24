@@ -3,9 +3,9 @@
                 #include <typeinfo>
         #include <cxxabi.h>
 
-Segmenter::Segmenter(std::string& PathToEngineFile)
+Segmenter::Segmenter()
 {
-    mPathToEngineFile = PathToEngineFile;
+
 }
 
 
@@ -15,18 +15,18 @@ Segmenter::~Segmenter()
     
 }
 
-bool Segmenter::LoadModel()
+bool Segmenter::LoadModelTrt(std::string& PathToModelFile)
 {
-    nvinferlogs::gLogInfo << "Loading STDC engine file (" << mPathToEngineFile << ")...\n";
+    nvinferlogs::gLogInfo << "Loading STDC engine file (" << PathToModelFile << ")...\n";
     nvinferlogs::gLogInfo.flush();
     
     // Open engine file
-    std::ifstream EngineFile(mPathToEngineFile, std::ios::binary);
+    std::ifstream EngineFile(PathToModelFile, std::ios::binary);
     
     // Error out if failed to open
     if (EngineFile.fail())
     {
-        nvinferlogs::gLogError << "Error: failed to open engine file located at: " << mPathToEngineFile << ".\n"; 
+        nvinferlogs::gLogError << "Error: failed to open engine file located at: " << PathToModelFile << ".\n"; 
         
         return false;
     }
@@ -64,6 +64,15 @@ bool Segmenter::LoadModel()
 
         return true;
     }
+}
+
+bool Segmenter::LoadModelOnnx(std::string& PathToModelFile)
+{
+    mOnnxModel = cv::dnn::readNet(cv::String(PathToModelFile));
+    mOnnxModel.setPreferableBackend(0);
+    mOnnxModel.setPreferableTarget(0);
+
+    return true;
 }
 
 
@@ -152,13 +161,28 @@ bool Segmenter::AllocateMemory()
     return true;
 }
 
-bool Segmenter::LoadAndPrepareModel()
+bool Segmenter::LoadAndPrepareModel(std::string& PathToModelFile)
 {
-    // Load 
-    bool LoadSuccessful = LoadModel();
+    // TODO: Handle onnx, trt, and pytorch 
+    std::size_t FileExtStart = PathToModelFile.find(".");
+    mModelFramework = PathToModelFile.substr(FileExtStart+1);
 
-    // Allocate
-    bool AllocateSuccessful = AllocateMemory();
+    bool LoadSuccessful = false;
+    bool AllocateSuccessful = false;
+    if(mModelFramework.compare("engine") == 0)
+    {
+        // Load 
+        LoadSuccessful = LoadModelTrt(PathToModelFile);
+
+        // Allocate
+        AllocateSuccessful = AllocateMemory();
+    }
+    else if(mModelFramework.compare("onnx") == 0)
+    {
+        LoadSuccessful = LoadModelOnnx(PathToModelFile);
+        AllocateSuccessful = true;
+    }
+
 
     return (LoadSuccessful && AllocateSuccessful);
 }
@@ -176,96 +200,249 @@ void Segmenter::FormatInput(cv::Mat& OriginalImage)
 
     // Standardize, remembering that cv mat's are BGR
     mFormattedImage = (mFormattedImage - cv::Scalar(mCityscapesMeans[2], mCityscapesMeans[1], mCityscapesMeans[0])) / cv::Scalar(mCityscapesStds[2], mCityscapesStds[1], mCityscapesStds[0]);
-    if(mFormattedImage.rows != mRequiredImageHeight || mFormattedImage.cols != mRequiredImageWidth)
+    
+    if(mModelFramework.compare("engine") == 0)
     {
-        cv::resize(mFormattedImage, mFormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+        // Resize if needed
+        if(mFormattedImage.rows != mRequiredImageHeight || mFormattedImage.cols != mRequiredImageWidth)
+        {
+            cv::resize(mFormattedImage, mFormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+        }
+
+        // OpenCV Mat is organized like: [B_00, G_00, R_00, B_01, G_01, R_01, ...]
+        // Read image pixels into float array in [R_00, R_01, ..., G_00, G_01, ..., B_00, B_01, ...] format, while normalizing
+        // https://stackoverflow.com/questions/37040787/opencv-in-memory-mat-representation
+        unsigned char* BluePixelPtr = mFormattedImage.data;
+        for (int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageWidth*mRequiredImageHeight; FlatPixelIdx++, BluePixelPtr+=3) 
+        {
+            mInputCpuBuffer[FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[2];
+
+            mInputCpuBuffer[mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[1];
+
+            mInputCpuBuffer[2*mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[0];      
+        }
     }
-
-    // OpenCV Mat is organized like: [B_00, G_00, R_00, B_01, G_01, R_01, ...]
-    // Read image pixels into float array in [R_00, R_01, ..., G_00, G_01, ..., B_00, B_01, ...] format, while normalizing
-    // https://stackoverflow.com/questions/37040787/opencv-in-memory-mat-representation
-    unsigned char* BluePixelPtr = mFormattedImage.data;
-    for (int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageWidth*mRequiredImageHeight; FlatPixelIdx++, BluePixelPtr+=3) 
+    else if(mModelFramework.compare("onnx") == 0)
     {
-        mInputCpuBuffer[FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[2];
+        mInputBlob = cv::dnn::blobFromImage(mFormattedImage, 1.0, cv::Size( ((double)mOriginalImageWidth)*.75, ((double)mOriginalImageHeight)*.75 ), cv::Scalar(), true, false, CV_32F);
+        mOnnxModel.setInput(mInputBlob);
 
-        mInputCpuBuffer[mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[1];
-
-        mInputCpuBuffer[2*mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[0];      
+        // For draw masks
+        cv::resize(mFormattedImage, mFormattedImage, cv::Size( ((double)mOriginalImageWidth)*.75, ((double)mOriginalImageHeight)*.75 ));
     }
 }
 
 bool Segmenter::RunInference()
 {
-    // Copy image data to GPU input memory
-    if (cudaMemcpyAsync(mGpuMemoryBindings[0], mInputCpuBuffer, mIoTensorMemorySizesInBytes[0], cudaMemcpyHostToDevice, mStream) != cudaSuccess)
+    if(mModelFramework.compare("engine") == 0)
     {
-        nvinferlogs::gLogError << "ERROR: Failed to copy input tensor to GPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
-        return false;
+        // Copy image data to GPU input memory
+        if (cudaMemcpyAsync(mGpuMemoryBindings[0], mInputCpuBuffer, mIoTensorMemorySizesInBytes[0], cudaMemcpyHostToDevice, mStream) != cudaSuccess)
+        {
+            nvinferlogs::gLogError << "ERROR: Failed to copy input tensor to GPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
+            return false;
+        }
+
+        // Asynchronously execute inference. enqueueV2(array of pts to input and output nn buffers, cuda stream, N/A)
+        bool InferenceStatus = mExecutionContext->enqueueV2(mGpuMemoryBindings, mStream, nullptr);
+        if (!InferenceStatus)
+        {
+            nvinferlogs::gLogError << "ERROR: TensorRT inference failed" << std::endl;
+            return false;
+        }
+        
+        // Copy predictions async from output binding memory
+        if (cudaMemcpyAsync(mOutputCpuBuffer, mGpuMemoryBindings[1], mIoTensorMemorySizesInBytes[1], cudaMemcpyDeviceToHost, mStream) != cudaSuccess)
+        {
+            nvinferlogs::gLogError << "ERROR: Failed to copy output tensor to CPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
+            return false;
+        }
+    }
+    else if(mModelFramework.compare("onnx") == 0)
+    {
+        // cv::Mat ZeroMat = cv::Mat(cv::Size(1536, 768), CV_32FC1, cv::Scalar(0.0));
+        // ZeroMat = mOnnxModel.forward();
+        mOnnxModelOutput = mOnnxModel.forward();
+
+        // mOnnxModelOutput = ZeroMat.clone();
     }
 
-    // Asynchronously execute inference. enqueueV2(array of pts to input and output nn buffers, cuda stream, N/A)
-    bool InferenceStatus = mExecutionContext->enqueueV2(mGpuMemoryBindings, mStream, nullptr);
-    if (!InferenceStatus)
-    {
-        nvinferlogs::gLogError << "ERROR: TensorRT inference failed" << std::endl;
-        return false;
-    }
-    
-    // Copy predictions async from output binding memory
-    if (cudaMemcpyAsync(mOutputCpuBuffer, mGpuMemoryBindings[1], mIoTensorMemorySizesInBytes[1], cudaMemcpyDeviceToHost, mStream) != cudaSuccess)
-    {
-        nvinferlogs::gLogError << "ERROR: Failed to copy output tensor to CPU, size = " << mIoTensorMemorySizesInBytes[0] << " bytes" << std::endl;
-        return false;
-    }
 
     return true;
 }
 
 void Segmenter::PerformPostProcessing(std::vector<cv::Mat>& Masks)
 {
-    // There is something wrong with using this container. When you set the value of one member Mat at (i, j), (i, j) is set to that value 
-    // for every member Mat. Have to be very careful w/ OpenCV's smart pointer style Mat
-    //
-    // std::vector<cv::Mat> Masks(mNumClasses, cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0)));
-
     Masks.clear();
-    cv::Mat ZeroMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0));
-
-    float MaxElement;
-    int ClassIdxOfMaxElement;
-    for(int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageHeight*mRequiredImageWidth; FlatPixelIdx++)
+    if(mModelFramework.compare("engine") == 0)
     {
-        // Find which of the mNumClasses classes pixel referred to by FlatPixelIdx belongs to. 
-        // This is just taking the argmax of each pixel across the mNumClasses masks. 
+        // There is something wrong with using this container. When you set the value of one member Mat at (i, j), (i, j) is set to that value 
+        // for every member Mat. Have to be very careful w/ OpenCV's smart pointer style Mat
+        //
+        // std::vector<cv::Mat> Masks(mNumClasses, cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0)));
+
+        cv::Mat ZeroMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0));
+        cv::Mat ZeroFloatMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_32FC1, cv::Scalar(0.0));
+
+        std::vector<cv::Mat> ClassScoreMatrices;
+
         for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
         {
-            // Set matrices for the first time
-            if(FlatPixelIdx == 0)
+            // ClassScoreMatrices.push_back(ZeroFloatMat.clone());
+            // Masks.push_back(ZeroMat.clone());
+
+            cv::Mat ClassScoreMatrix = ZeroFloatMat.clone();
+
+            for(int RowIdx = 0; RowIdx < mRequiredImageHeight; RowIdx++)
             {
-                Masks.push_back(ZeroMat.clone());
+                for(int ColIdx = 0; ColIdx < mRequiredImageWidth; ColIdx++)
+                {
+                    ClassScoreMatrix.at<float>(RowIdx, ColIdx) = mOutputCpuBuffer[ClassIdx*mRequiredImageWidth*mRequiredImageHeight + RowIdx*mRequiredImageWidth + ColIdx];
+                }
             }
 
-            // Handle first iter
-            if(ClassIdx == 0)
+            ClassScoreMatrices.push_back(ClassScoreMatrix.clone());
+        }
+
+        // Go through class score's and argmax
+        cv::Mat ArgMaxMat = ZeroMat.clone();
+        int IdxOfMaxVal = -1;
+        float MaxVal = -1e5;
+        for(int RowIdx = 0; RowIdx < mRequiredImageHeight; RowIdx++)
+        {
+            for(int ColIdx = 0; ColIdx < mRequiredImageWidth; ColIdx++)
             {
-                MaxElement = mOutputCpuBuffer[FlatPixelIdx];
-                ClassIdxOfMaxElement = ClassIdx;
-            }
-            else
-            {
-                // New max
-                if(mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth] > MaxElement)
+                for(int ClassIdx = 0; ClassIdx < ClassScoreMatrices.size(); ClassIdx++)
                 {
-                    MaxElement = mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth];
-                    ClassIdxOfMaxElement = ClassIdx;
+                    if(ClassIdx == 0)
+                    {
+                        MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                        IdxOfMaxVal = ClassIdx;
+                    }
+                    else
+                    {
+                        if(ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx) > MaxVal)
+                        {
+                            MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                            IdxOfMaxVal = ClassIdx;
+                        }
+                    }
                 }
+
+                ArgMaxMat.at<uint8_t>(RowIdx, ColIdx) = (uint8_t)IdxOfMaxVal;
             }
         }
 
-        // Translation from flat pixel idx to non flat pixel idx
-        Masks.at(ClassIdxOfMaxElement).at<unsigned char>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth) = 1;
+        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+        {
+            cv::Mat Temp = (ArgMaxMat == ClassIdx);
+            Masks.push_back(Temp.clone());
+            cv::imwrite("/home/integrity/Downloads/LilTest.jpeg", Masks[0]);
+        }
+
+        // std::cout << ArgMaxMat << std::endl;
+
+
+
+        // float MaxElement;
+        // int ClassIdxOfMaxElement;
+        // for(int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageHeight*mRequiredImageWidth; FlatPixelIdx++)
+        // {
+        //     // Find which of the mNumClasses classes pixel referred to by FlatPixelIdx belongs to. 
+        //     // This is just taking the argmax of each pixel across the mNumClasses masks. 
+        //     for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+        //     {
+        //         // Set matrices for the first time
+        //         if(FlatPixelIdx == 0)
+        //         {
+        //             Masks.push_back(ZeroMat.clone());
+        //         }
+
+        //         // Handle first iter
+        //         if(ClassIdx == 0)
+        //         {
+        //             MaxElement = mOutputCpuBuffer[FlatPixelIdx];
+        //             ClassIdxOfMaxElement = ClassIdx;
+        //         }
+        //         else
+        //         {
+        //             // New max
+        //             if(mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth] > MaxElement)
+        //             {
+        //                 MaxElement = mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth];
+        //                 ClassIdxOfMaxElement = ClassIdx;
+        //             }
+        //         }
+        //     }
+
+        //     // Translation from flat pixel idx to non flat pixel idx
+        //     Masks.at(ClassIdxOfMaxElement).at<unsigned char>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth) = 1;
+        // }
     }
+    else if(mModelFramework.compare("onnx") == 0)
+    {
+        std::cout << "Post proc" << std::endl;
+        std::vector<cv::Mat> ClassScoreMatrices;
+        cv::Mat ZeroFloatMat = cv::Mat(cv::Size(1536, 768), CV_32FC1, cv::Scalar(0.0));
+
+        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+        {
+            // ClassScoreMatrices.push_back(ZeroFloatMat.clone());
+            // Masks.push_back(ZeroMat.clone());
+
+            cv::Mat ClassScoreMatrix = ZeroFloatMat.clone();
+
+            for(int RowIdx = 0; RowIdx < 768; RowIdx++)
+            {
+                for(int ColIdx = 0; ColIdx < 1536; ColIdx++)
+                {
+                    ClassScoreMatrix.at<float>(RowIdx, ColIdx) = mOnnxModelOutput.at<cv::Vec<float, 1536>>(0, ClassIdx, RowIdx)[ColIdx];
+                }
+            }
+
+            ClassScoreMatrices.push_back(ClassScoreMatrix.clone());
+        }
+
+        cv::Mat ZeroMat = cv::Mat(cv::Size(1536, 768), CV_8UC1, cv::Scalar(0));
+
+        // Go through class score's and argmax
+        cv::Mat ArgMaxMat = ZeroMat.clone();
+        int IdxOfMaxVal = -1;
+        float MaxVal = -1e5;
+        for(int RowIdx = 0; RowIdx < 768; RowIdx++)
+        {
+            for(int ColIdx = 0; ColIdx < 1536; ColIdx++)
+            {
+                for(int ClassIdx = 0; ClassIdx < ClassScoreMatrices.size(); ClassIdx++)
+                {
+                    if(ClassIdx == 0)
+                    {
+                        MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                        IdxOfMaxVal = ClassIdx;
+                    }
+                    else
+                    {
+                        if(ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx) > MaxVal)
+                        {
+                            MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                            IdxOfMaxVal = ClassIdx;
+                        }
+                    }
+                }
+
+                ArgMaxMat.at<uint8_t>(RowIdx, ColIdx) = (uint8_t)IdxOfMaxVal;
+            }
+        }
+
+        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+        {
+            cv::Mat Temp = (ArgMaxMat == ClassIdx);
+            Masks.push_back(Temp.clone());
+        }
+
+        cv::imwrite("/home/integrity/Downloads/LilTest.jpeg", Masks[13]);
+    }
+
 }
 
 bool Segmenter::ProcessFrame(cv::Mat& OriginalImage, std::vector<cv::Mat>& Masks)
@@ -284,9 +461,11 @@ bool Segmenter::ProcessFrame(cv::Mat& OriginalImage, std::vector<cv::Mat>& Masks
 
 cv::Mat Segmenter::DrawMasks(std::vector<cv::Mat>& Masks)
 {
+    std::cout << "here 5" << std::endl;
     cv::Mat MaskFilteredFormattedImage;
     for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
     {
+        std::cout << "ClassIdx: " << ClassIdx << std::endl;
         // Ignore classes with no assigned pixels
         if(cv::countNonZero(Masks[ClassIdx]) != 0)
         {
@@ -301,11 +480,11 @@ cv::Mat Segmenter::DrawMasks(std::vector<cv::Mat>& Masks)
         }
     }
 
-    if(mOriginalImageWidth != mRequiredImageWidth || mOriginalImageHeight != mRequiredImageHeight)
+    if(mOriginalImageWidth != 1536 || mOriginalImageHeight != 768)
+    // if(mOriginalImageWidth != mRequiredImageWidth || mOriginalImageHeight != mRequiredImageHeight)
     {
         cv::resize(mFormattedImage, mFormattedImage, cv::Size(mOriginalImageWidth, mOriginalImageHeight));
     }
 
     return mFormattedImage;
-
 }

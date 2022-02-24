@@ -6,10 +6,12 @@
 #include <vector>
 #include <fstream>  // fopen
 #include <numeric>  // accumulate
+// #include <string>   // substr
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <opencv2/dnn.hpp>
 
 #include "NvInfer.h"
 
@@ -37,13 +39,13 @@ class Segmenter {
             }
         };
 
-        Segmenter(std::string&);
+        Segmenter();
         ~Segmenter();
 
         std::string mPathToEngineFile = "";
 
 
-        bool LoadAndPrepareModel();
+        bool LoadAndPrepareModel(std::string&);
         size_t ComputeTensorSizeInBytes(nvinfer1::Dims&, int32_t);
         bool ProcessFrame(cv::Mat&, std::vector<cv::Mat>&);
         cv::Mat DrawMasks(std::vector<cv::Mat>&);
@@ -51,13 +53,15 @@ class Segmenter {
 
     private:
 
-        bool LoadModel();
+        bool LoadModelTrt(std::string&);
+        bool LoadModelOnnx(std::string&);
         bool AllocateMemory();
         void FormatInput(cv::Mat&);
         bool RunInference();
         void PerformPostProcessing(std::vector<cv::Mat>&);
 
         std::unique_ptr<nvinfer1::ICudaEngine, TensorRTDeleter> mEnginePtr = nullptr;
+        cv::dnn::Net mOnnxModel;
         std::unique_ptr<nvinfer1::IExecutionContext, TensorRTDeleter> mExecutionContext = nullptr;
         int mRequiredImageWidth = -1;
         int mRequiredImageHeight = -1;
@@ -73,6 +77,9 @@ class Segmenter {
         std::vector<float> mCityscapesMeans{.485, .456, .406};
         std::vector<float> mCityscapesStds{.229, .224, .225};
         std::vector<cv::Mat> mMasks;
+        std::string mModelFramework = "";
+        cv::Mat mInputBlob;
+        cv::Mat mOnnxModelOutput;
 
         std::vector<std::string> mCityscapesClasses{"road", "sidewalk", "building", "wall", "fence", "pole", "traffic light", "traffic sign",
                                                     "vegetation", "terrain", "sky", "person", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"};

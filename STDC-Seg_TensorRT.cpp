@@ -6,13 +6,15 @@
 
 int main(int argc, char** argv)
 {
-	std::string PathToEngineFile = "/home/integrity/Downloads/STDC2-Seg75Opset11.engine";
+	// std::string PathToEngineFile = "/home/integrity/Downloads/STDC2-Seg75Cpu.engine";
+	std::string PathToEngineFile = "/home/integrity/Downloads/STDC1-Seg75.onnx";
 
-	Segmenter SegmentationObj(PathToEngineFile);
+	Segmenter SegmentationObj;
 
-	bool InitSuccessful = SegmentationObj.LoadAndPrepareModel();
+	bool InitSuccessful = SegmentationObj.LoadAndPrepareModel(PathToEngineFile);
 
 	cv::Mat Frame = cv::imread("/home/integrity/Downloads/TestImg.png", cv::IMREAD_UNCHANGED);
+	// cv::Mat Frame = cv::imread("/home/integrity/Downloads/cityscapesTestImg.jpg");//, cv::IMREAD_UNCHANGED);
 	// Frame = Frame[:,:,0:3];
 
 	std::vector<cv::Mat> Masks;
