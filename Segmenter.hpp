@@ -80,6 +80,7 @@ class Segmenter {
         std::string mModelFramework = "";
         cv::Mat mInputBlob;
         cv::Mat mOnnxModelOutput;
+        cv::Mat mImageWithOverlays;
 
         std::vector<std::string> mCityscapesClasses{"road", "sidewalk", "building", "wall", "fence", "pole", "traffic light", "traffic sign",
                                                     "vegetation", "terrain", "sky", "person", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle"};

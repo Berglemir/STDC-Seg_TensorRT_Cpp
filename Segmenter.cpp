@@ -100,10 +100,11 @@ bool Segmenter::AllocateMemory()
     
     // Model file defines a mapping that assigns tensor names to integer identifiers (indices)
     // Get the identifying index of the input tensor (named input), error out if you can't find it.
-    int32_t InputTensorIdx = mEnginePtr->getBindingIndex("input");
+    std::string InputTensorName = "x";
+    int32_t InputTensorIdx = mEnginePtr->getBindingIndex(InputTensorName.c_str());
     if (InputTensorIdx == -1)
     {
-        nvinferlogs::gLogError << "Could not find tensor \'input\'.\n";
+        nvinferlogs::gLogError << "Could not find tensor \'" << InputTensorName << "\'.\n";
         
         return false;
     }
@@ -121,9 +122,11 @@ bool Segmenter::AllocateMemory()
     mIoTensorMemorySizesInBytes.push_back(InputTensorSizeInBytes);
                                    
     // Repeat with output tensor
-    int32_t OutputTensorIdx = mEnginePtr->getBindingIndex("output");
+    std::string OutputTensorName = "bilinear_interp_v2_0.tmp_0";
+    int32_t OutputTensorIdx = mEnginePtr->getBindingIndex(OutputTensorName.c_str());
     if (OutputTensorIdx == -1)
     {
+        nvinferlogs::gLogError << "Could not find tensor \'" << OutputTensorName << "\'.\n";
         return false;
     }
     nvinfer1::Dims OutputTensorDimensions = mExecutionContext->getBindingDimensions(OutputTensorIdx);
@@ -192,6 +195,7 @@ void Segmenter::FormatInput(cv::Mat& OriginalImage)
 
     // Start off with regular image
     mFormattedImage = OriginalImage.clone();
+    mImageWithOverlays = OriginalImage.clone();
     mOriginalImageHeight = mFormattedImage.rows;
     mOriginalImageWidth = mFormattedImage.cols;
 
@@ -207,7 +211,9 @@ void Segmenter::FormatInput(cv::Mat& OriginalImage)
         if(mFormattedImage.rows != mRequiredImageHeight || mFormattedImage.cols != mRequiredImageWidth)
         {
             cv::resize(mFormattedImage, mFormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+            cv::resize(mImageWithOverlays, mImageWithOverlays, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
         }
+
 
         // OpenCV Mat is organized like: [B_00, G_00, R_00, B_01, G_01, R_01, ...]
         // Read image pixels into float array in [R_00, R_01, ..., G_00, G_01, ..., B_00, B_01, ...] format, while normalizing
@@ -260,11 +266,7 @@ bool Segmenter::RunInference()
     }
     else if(mModelFramework.compare("onnx") == 0)
     {
-        // cv::Mat ZeroMat = cv::Mat(cv::Size(1536, 768), CV_32FC1, cv::Scalar(0.0));
-        // ZeroMat = mOnnxModel.forward();
         mOnnxModelOutput = mOnnxModel.forward();
-
-        // mOnnxModelOutput = ZeroMat.clone();
     }
 
 
@@ -273,176 +275,67 @@ bool Segmenter::RunInference()
 
 void Segmenter::PerformPostProcessing(std::vector<cv::Mat>& Masks)
 {
+    // This whole function needs to be optimized. Maybe use PaddleSeg's options to implement argmax and softmax.
     Masks.clear();
-    if(mModelFramework.compare("engine") == 0)
+
+    cv::Mat ZeroMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0));
+    cv::Mat ZeroFloatMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_32FC1, cv::Scalar(0.0));
+    std::vector<cv::Mat> ClassScoreMatrices;
+
+    // Move output to friendlier container
+    for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
     {
-        // There is something wrong with using this container. When you set the value of one member Mat at (i, j), (i, j) is set to that value 
-        // for every member Mat. Have to be very careful w/ OpenCV's smart pointer style Mat
-        //
-        // std::vector<cv::Mat> Masks(mNumClasses, cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0)));
+        cv::Mat ClassScoreMatrix = ZeroFloatMat.clone();
 
-        cv::Mat ZeroMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_8UC1, cv::Scalar(0));
-        cv::Mat ZeroFloatMat = cv::Mat(cv::Size(mRequiredImageWidth, mRequiredImageHeight), CV_32FC1, cv::Scalar(0.0));
-
-        std::vector<cv::Mat> ClassScoreMatrices;
-
-        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
-        {
-            // ClassScoreMatrices.push_back(ZeroFloatMat.clone());
-            // Masks.push_back(ZeroMat.clone());
-
-            cv::Mat ClassScoreMatrix = ZeroFloatMat.clone();
-
-            for(int RowIdx = 0; RowIdx < mRequiredImageHeight; RowIdx++)
-            {
-                for(int ColIdx = 0; ColIdx < mRequiredImageWidth; ColIdx++)
-                {
-                    ClassScoreMatrix.at<float>(RowIdx, ColIdx) = mOutputCpuBuffer[ClassIdx*mRequiredImageWidth*mRequiredImageHeight + RowIdx*mRequiredImageWidth + ColIdx];
-                }
-            }
-
-            ClassScoreMatrices.push_back(ClassScoreMatrix.clone());
-        }
-
-        // Go through class score's and argmax
-        cv::Mat ArgMaxMat = ZeroMat.clone();
-        int IdxOfMaxVal = -1;
-        float MaxVal = -1e5;
         for(int RowIdx = 0; RowIdx < mRequiredImageHeight; RowIdx++)
         {
             for(int ColIdx = 0; ColIdx < mRequiredImageWidth; ColIdx++)
             {
-                for(int ClassIdx = 0; ClassIdx < ClassScoreMatrices.size(); ClassIdx++)
+                if(mModelFramework.compare("engine") == 0)
                 {
-                    if(ClassIdx == 0)
-                    {
-                        MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
-                        IdxOfMaxVal = ClassIdx;
-                    }
-                    else
-                    {
-                        if(ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx) > MaxVal)
-                        {
-                            MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
-                            IdxOfMaxVal = ClassIdx;
-                        }
-                    }
+                    ClassScoreMatrix.at<float>(RowIdx, ColIdx) = mOutputCpuBuffer[ClassIdx*mRequiredImageWidth*mRequiredImageHeight + RowIdx*mRequiredImageWidth + ColIdx];
                 }
-
-                ArgMaxMat.at<uint8_t>(RowIdx, ColIdx) = (uint8_t)IdxOfMaxVal;
-            }
-        }
-
-        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
-        {
-            cv::Mat Temp = (ArgMaxMat == ClassIdx);
-            Masks.push_back(Temp.clone());
-            cv::imwrite("/home/integrity/Downloads/LilTest.jpeg", Masks[0]);
-        }
-
-        // std::cout << ArgMaxMat << std::endl;
-
-
-
-        // float MaxElement;
-        // int ClassIdxOfMaxElement;
-        // for(int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageHeight*mRequiredImageWidth; FlatPixelIdx++)
-        // {
-        //     // Find which of the mNumClasses classes pixel referred to by FlatPixelIdx belongs to. 
-        //     // This is just taking the argmax of each pixel across the mNumClasses masks. 
-        //     for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
-        //     {
-        //         // Set matrices for the first time
-        //         if(FlatPixelIdx == 0)
-        //         {
-        //             Masks.push_back(ZeroMat.clone());
-        //         }
-
-        //         // Handle first iter
-        //         if(ClassIdx == 0)
-        //         {
-        //             MaxElement = mOutputCpuBuffer[FlatPixelIdx];
-        //             ClassIdxOfMaxElement = ClassIdx;
-        //         }
-        //         else
-        //         {
-        //             // New max
-        //             if(mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth] > MaxElement)
-        //             {
-        //                 MaxElement = mOutputCpuBuffer[FlatPixelIdx + ClassIdx*mRequiredImageHeight*mRequiredImageWidth];
-        //                 ClassIdxOfMaxElement = ClassIdx;
-        //             }
-        //         }
-        //     }
-
-        //     // Translation from flat pixel idx to non flat pixel idx
-        //     Masks.at(ClassIdxOfMaxElement).at<unsigned char>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth) = 1;
-        // }
-    }
-    else if(mModelFramework.compare("onnx") == 0)
-    {
-        std::cout << "Post proc" << std::endl;
-        std::vector<cv::Mat> ClassScoreMatrices;
-        cv::Mat ZeroFloatMat = cv::Mat(cv::Size(1536, 768), CV_32FC1, cv::Scalar(0.0));
-
-        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
-        {
-            // ClassScoreMatrices.push_back(ZeroFloatMat.clone());
-            // Masks.push_back(ZeroMat.clone());
-
-            cv::Mat ClassScoreMatrix = ZeroFloatMat.clone();
-
-            for(int RowIdx = 0; RowIdx < 768; RowIdx++)
-            {
-                for(int ColIdx = 0; ColIdx < 1536; ColIdx++)
+                else if(mModelFramework.compare("onnx") == 0)
                 {
                     ClassScoreMatrix.at<float>(RowIdx, ColIdx) = mOnnxModelOutput.at<cv::Vec<float, 1536>>(0, ClassIdx, RowIdx)[ColIdx];
                 }
             }
-
-            ClassScoreMatrices.push_back(ClassScoreMatrix.clone());
         }
 
-        cv::Mat ZeroMat = cv::Mat(cv::Size(1536, 768), CV_8UC1, cv::Scalar(0));
-
-        // Go through class score's and argmax
-        cv::Mat ArgMaxMat = ZeroMat.clone();
-        int IdxOfMaxVal = -1;
-        float MaxVal = -1e5;
-        for(int RowIdx = 0; RowIdx < 768; RowIdx++)
-        {
-            for(int ColIdx = 0; ColIdx < 1536; ColIdx++)
-            {
-                for(int ClassIdx = 0; ClassIdx < ClassScoreMatrices.size(); ClassIdx++)
-                {
-                    if(ClassIdx == 0)
-                    {
-                        MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
-                        IdxOfMaxVal = ClassIdx;
-                    }
-                    else
-                    {
-                        if(ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx) > MaxVal)
-                        {
-                            MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
-                            IdxOfMaxVal = ClassIdx;
-                        }
-                    }
-                }
-
-                ArgMaxMat.at<uint8_t>(RowIdx, ColIdx) = (uint8_t)IdxOfMaxVal;
-            }
-        }
-
-        for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
-        {
-            cv::Mat Temp = (ArgMaxMat == ClassIdx);
-            Masks.push_back(Temp.clone());
-        }
-
-        cv::imwrite("/home/integrity/Downloads/LilTest.jpeg", Masks[13]);
+        ClassScoreMatrices.push_back(ClassScoreMatrix.clone());
     }
 
+    // Go through class score's and argmax
+    cv::Mat ArgMaxMat = ZeroMat.clone();
+    int IdxOfMaxVal = -1;
+    float MaxVal = -1e5;
+    for(int RowIdx = 0; RowIdx < mRequiredImageHeight; RowIdx++)
+    {
+        for(int ColIdx = 0; ColIdx < mRequiredImageWidth; ColIdx++)
+        {
+            for(int ClassIdx = 0; ClassIdx < ClassScoreMatrices.size(); ClassIdx++)
+            {
+                if(ClassIdx == 0)
+                {
+                    MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                    IdxOfMaxVal = ClassIdx;
+                }
+                else if(ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx) > MaxVal)
+                {
+                        MaxVal = ClassScoreMatrices[ClassIdx].at<float>(RowIdx, ColIdx);
+                        IdxOfMaxVal = ClassIdx;
+                }
+            }
+
+            ArgMaxMat.at<uint8_t>(RowIdx, ColIdx) = (uint8_t)IdxOfMaxVal;
+        }
+    }
+
+    for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
+    {
+        cv::Mat Temp = (ArgMaxMat == ClassIdx);
+        Masks.push_back(Temp.clone());
+    }
 }
 
 bool Segmenter::ProcessFrame(cv::Mat& OriginalImage, std::vector<cv::Mat>& Masks)
@@ -461,30 +354,28 @@ bool Segmenter::ProcessFrame(cv::Mat& OriginalImage, std::vector<cv::Mat>& Masks
 
 cv::Mat Segmenter::DrawMasks(std::vector<cv::Mat>& Masks)
 {
-    std::cout << "here 5" << std::endl;
     cv::Mat MaskFilteredFormattedImage;
     for(int ClassIdx = 0; ClassIdx < mNumClasses; ClassIdx++)
     {
-        std::cout << "ClassIdx: " << ClassIdx << std::endl;
         // Ignore classes with no assigned pixels
         if(cv::countNonZero(Masks[ClassIdx]) != 0)
         {
             // Sets MaskFilteredFormattedImage(x,y) = mFormattedImage(x,y) & mFormattedImage(x,y) = mFormattedImage(x,y), if Masks[ClassIdx](x,y) = 1
-            cv::bitwise_and(mFormattedImage, mFormattedImage, MaskFilteredFormattedImage, Masks[ClassIdx]);
+            cv::bitwise_and(mImageWithOverlays, mImageWithOverlays, MaskFilteredFormattedImage, Masks[ClassIdx]);
 
             // Colorize
             MaskFilteredFormattedImage = .6*mCityscapesColors[ClassIdx] + .3*MaskFilteredFormattedImage;
 
             // Put back on image
-            MaskFilteredFormattedImage.copyTo(mFormattedImage, Masks[ClassIdx]);
+            MaskFilteredFormattedImage.copyTo(mImageWithOverlays, Masks[ClassIdx]);
         }
     }
 
-    if(mOriginalImageWidth != 1536 || mOriginalImageHeight != 768)
-    // if(mOriginalImageWidth != mRequiredImageWidth || mOriginalImageHeight != mRequiredImageHeight)
+    // if(mOriginalImageWidth != 1536 || mOriginalImageHeight != 768)
+    if(mOriginalImageWidth != mRequiredImageWidth || mOriginalImageHeight != mRequiredImageHeight)
     {
-        cv::resize(mFormattedImage, mFormattedImage, cv::Size(mOriginalImageWidth, mOriginalImageHeight));
+        cv::resize(mImageWithOverlays, mImageWithOverlays, cv::Size(mOriginalImageWidth, mOriginalImageHeight));
     }
 
-    return mFormattedImage;
+    return mImageWithOverlays;
 }
