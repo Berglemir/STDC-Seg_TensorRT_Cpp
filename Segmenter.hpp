@@ -71,7 +71,6 @@ class Segmenter {
         int mNumClasses = 19;
         void* mGpuMemoryBindings[2] = {nullptr, nullptr};
         cudaStream_t mStream;
-        cv::Mat mFormattedImage;
         int mOriginalImageHeight = -1;
         int mOriginalImageWidth = -1;
         std::vector<float> mCityscapesMeans{.485, .456, .406};

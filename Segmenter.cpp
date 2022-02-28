@@ -69,6 +69,8 @@ bool Segmenter::LoadModelTrt(std::string& PathToModelFile)
 bool Segmenter::LoadModelOnnx(std::string& PathToModelFile)
 {
     mOnnxModel = cv::dnn::readNet(cv::String(PathToModelFile));
+
+    // Auto-select backend + targeted device. Never tested on GPU, only CPU. 
     mOnnxModel.setPreferableBackend(0);
     mOnnxModel.setPreferableTarget(0);
 
@@ -166,7 +168,6 @@ bool Segmenter::AllocateMemory()
 
 bool Segmenter::LoadAndPrepareModel(std::string& PathToModelFile)
 {
-    // TODO: Handle onnx, trt, and pytorch 
     std::size_t FileExtStart = PathToModelFile.find(".");
     mModelFramework = PathToModelFile.substr(FileExtStart+1);
 
@@ -192,25 +193,25 @@ bool Segmenter::LoadAndPrepareModel(std::string& PathToModelFile)
 
 void Segmenter::FormatInput(cv::Mat& OriginalImage)
 {
+    // Start with copy of input image
+    cv::Mat FormattedImage = OriginalImage.clone();
 
-    // Start off with regular image
-    mFormattedImage = OriginalImage.clone();
-    mImageWithOverlays = OriginalImage.clone();
-    mOriginalImageHeight = mFormattedImage.rows;
-    mOriginalImageWidth = mFormattedImage.cols;
+    // Fill in member vars (mImageWithOverlays is used for visualization)
+    mImageWithOverlays = OriginalImage.clone(); 
+    mOriginalImageHeight = FormattedImage.rows;
+    mOriginalImageWidth = FormattedImage.cols;
 
-    // Normalize (and make sure mat is 32FC3)
-    mFormattedImage.convertTo(mFormattedImage, CV_32FC3, 1.0/255.0);
+    // Make sure image is 32FC3
+    FormattedImage.convertTo(FormattedImage, CV_32FC3);
 
-    // Standardize, remembering that cv mat's are BGR
-    mFormattedImage = (mFormattedImage - cv::Scalar(mCityscapesMeans[2], mCityscapesMeans[1], mCityscapesMeans[0])) / cv::Scalar(mCityscapesStds[2], mCityscapesStds[1], mCityscapesStds[0]);
-    
     if(mModelFramework.compare("engine") == 0)
     {
         // Resize if needed
-        if(mFormattedImage.rows != mRequiredImageHeight || mFormattedImage.cols != mRequiredImageWidth)
+        if(FormattedImage.rows != mRequiredImageHeight || FormattedImage.cols != mRequiredImageWidth)
         {
-            cv::resize(mFormattedImage, mFormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+            cv::resize(FormattedImage, FormattedImage, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
+
+            // Overlays are output for inference dimensions
             cv::resize(mImageWithOverlays, mImageWithOverlays, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
         }
 
@@ -218,23 +219,39 @@ void Segmenter::FormatInput(cv::Mat& OriginalImage)
         // OpenCV Mat is organized like: [B_00, G_00, R_00, B_01, G_01, R_01, ...]
         // Read image pixels into float array in [R_00, R_01, ..., G_00, G_01, ..., B_00, B_01, ...] format, while normalizing
         // https://stackoverflow.com/questions/37040787/opencv-in-memory-mat-representation
-        unsigned char* BluePixelPtr = mFormattedImage.data;
-        for (int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageWidth*mRequiredImageHeight; FlatPixelIdx++, BluePixelPtr+=3) 
+        int RowIdx = -1;
+        int ColIdx = -1;
+        int ChannelOffset = mRequiredImageWidth*mRequiredImageHeight;
+        for (int FlatPixelIdx = 0; FlatPixelIdx < mRequiredImageWidth*mRequiredImageHeight; FlatPixelIdx++) 
         {
-            mInputCpuBuffer[FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[2];
+            // Translate flat index to 2D index
+            RowIdx = FlatPixelIdx / mRequiredImageWidth;
+            ColIdx = FlatPixelIdx % mRequiredImageWidth;
 
-            mInputCpuBuffer[mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[1];
+            // Handle red pixel, then green, then blue. Normalize intensities to [0,1], and standardize using cityscapes means and stds.
+            mInputCpuBuffer[FlatPixelIdx] = (FormattedImage.at<cv::Vec3f>(RowIdx, ColIdx)[2]/255.0 - mCityscapesMeans[2])/mCityscapesStds[2];
 
-            mInputCpuBuffer[2*mRequiredImageWidth*mRequiredImageHeight + FlatPixelIdx] = mFormattedImage.at<cv::Vec3f>(FlatPixelIdx / mRequiredImageWidth, FlatPixelIdx % mRequiredImageWidth)[0];      
+            mInputCpuBuffer[ChannelOffset + FlatPixelIdx] = (FormattedImage.at<cv::Vec3f>(RowIdx, ColIdx)[1]/255.0 - mCityscapesMeans[1])/mCityscapesStds[1];
+
+            mInputCpuBuffer[2*ChannelOffset + FlatPixelIdx] = (FormattedImage.at<cv::Vec3f>(RowIdx, ColIdx)[0]/255.0 - mCityscapesMeans[0])/mCityscapesStds[0];  
         }
     }
     else if(mModelFramework.compare("onnx") == 0)
     {
-        mInputBlob = cv::dnn::blobFromImage(mFormattedImage, 1.0, cv::Size( ((double)mOriginalImageWidth)*.75, ((double)mOriginalImageHeight)*.75 ), cv::Scalar(), true, false, CV_32F);
+        // Standardize, remembering that cv mat's are BGR
+        FormattedImage = FormattedImage/255.0;
+        FormattedImage = (FormattedImage - cv::Scalar(mCityscapesMeans[2], mCityscapesMeans[1], mCityscapesMeans[0])) / cv::Scalar(mCityscapesStds[2], mCityscapesStds[1], mCityscapesStds[0]);
+
+        // OpenCV cannot dynamically determine input tensor size. Hard code until you find a better solution.
+        mRequiredImageWidth = 1024;
+        mRequiredImageHeight = 512;
+
+        // Resize is done w/ blobFromImage.
+        mInputBlob = cv::dnn::blobFromImage(FormattedImage, 1.0, cv::Size(mRequiredImageWidth, mRequiredImageHeight), cv::Scalar(), true, false, CV_32F);
         mOnnxModel.setInput(mInputBlob);
 
-        // For draw masks
-        cv::resize(mFormattedImage, mFormattedImage, cv::Size( ((double)mOriginalImageWidth)*.75, ((double)mOriginalImageHeight)*.75 ));
+        // Overlays are output for inference dimensions
+        cv::resize(mImageWithOverlays, mImageWithOverlays, cv::Size(mRequiredImageWidth, mRequiredImageHeight));
     }
 }
 
@@ -360,7 +377,7 @@ cv::Mat Segmenter::DrawMasks(std::vector<cv::Mat>& Masks)
         // Ignore classes with no assigned pixels
         if(cv::countNonZero(Masks[ClassIdx]) != 0)
         {
-            // Sets MaskFilteredFormattedImage(x,y) = mFormattedImage(x,y) & mFormattedImage(x,y) = mFormattedImage(x,y), if Masks[ClassIdx](x,y) = 1
+            // Sets MaskFilteredFormattedImage(x,y) = mImageWithOverlays(x,y) & mImageWithOverlays(x,y) = mImageWithOverlays(x,y), if Masks[ClassIdx](x,y) = 1
             cv::bitwise_and(mImageWithOverlays, mImageWithOverlays, MaskFilteredFormattedImage, Masks[ClassIdx]);
 
             // Colorize
