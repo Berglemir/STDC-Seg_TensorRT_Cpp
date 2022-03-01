@@ -15,6 +15,8 @@ This repo is a C++ TensorRT deployment of STDC2-Seg50 from the following paper:
 
 ```
 
+I originally started this project to get a feel for what kind of hardware would be required to achieve real-time semantic segmentation in a practical setting.  
+
 ## Environment
 
 * Ubuntu 20.04
@@ -75,4 +77,5 @@ You also have the option of using an ONNX model rather than a TensorRT engine. T
 Huge thanks to the original authors and to PaddleSeg for providing the utilities that generated the onnx file this project is based on.
 
 https://github.com/MichaelFan01/STDC-Seg
+
 https://github.com/PaddlePaddle/PaddleSeg
