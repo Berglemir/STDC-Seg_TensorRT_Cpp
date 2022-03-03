@@ -47,7 +47,7 @@ int main(int argc, char** argv)
         Segmenter SegmentationObj;
         bool InitSuccessful = SegmentationObj.LoadAndPrepareModel(PathToModelFile);
 
-        // Infer save name from input name
+        // Search for file extension start
         std::size_t FileExtStart = FullPathToInputFileOrDir.find(".");
 
         // Default values handle video as seq. of frames case 
@@ -79,8 +79,6 @@ int main(int argc, char** argv)
         }
         else if(FileType == "video")
         {
-            // Set mode so we never have to check again
-            InputMode = 1;
 
             // Output methods
             cv::namedWindow("Processed");   
@@ -162,7 +160,6 @@ int main(int argc, char** argv)
             // Show & save
             if(InputMode == 0)
             {
-                std::cout << SaveFileName
                 cv::imwrite(SaveFileName, OutputImage);
             }
             else
